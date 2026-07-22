@@ -5,6 +5,154 @@
 
 namespace cg = cooperative_groups;
 
+
+__device__ void  qk_norm_rope_cache(
+    float * __restrict__ g_q,
+    float * __restrict__ g_k,
+    float * __restrict__ g_v,
+
+    const __nv_bfloat16* __restrict__ q_norm_weight,
+    const __nv_bfloat16* __restrict__ k_norm_weight,
+    const __nv_bfloat16* __restrict__ cos_table, 
+    const __nv_bfloat16* __restrict__ sin_table, 
+    __nv_bfloat16 * k_cache,
+    __nv_bfloat16 * v_cache,
+    int position,
+    int max_seq_len
+    
+){
+    const int warp_id  = threadIdx.x / WARP_SIZE;
+    const int lane_id  = threadIdx.x % WARP_SIZE;
+
+    const int global_warp_id = blockIdx.x * NUM_WARPS + warp_id; //this tells us that globally what warp we are in 108*8
+
+    const __nv_bfloat16  *cos_row = cos_table + static_cast<size_t>(position) * HEAD_DIM; 
+    const __nv_bfloat16 *sin_row = sin_table + static_cast<size_t>(position) * HEAD_DIM;
+
+
+    if (global_warp_id<NUM_Q_HEADS){
+
+        const int q_head = global_warp_id;
+        const int head_offset  = q_head * HEAD_DIM;
+
+        float local_sum_sq = 0.0f;
+
+        for (int d = lane_id;d<HEAD_DIM;d+=WARP_SIZE){
+            const float value = g_q[head_offset+d];
+            
+            local_sum_sq += value * value;
+        }
+
+        float sum_sq  = warp_reduce_sum(local_sum_sq); //lane 0 has the final answer 
+
+        sum_sq = __shfl_sync(0xffffffff,sum_sq,0); //broadcast lane id's 0 sum to all other lanes (the 0 in the end is what to broadcast from )
+
+        const float rstd = rsqrtf(
+            sum_sq / HEAD_DIM + RMS_NORM_EPS
+        );
+
+        for (int d = lane_id; d<HEAD_DIM/2;d+=WARP_SIZE){
+
+            const int first_index  = head_offset +d;
+            const int second_index = head_offset + d + HEAD_DIM /2;
+
+            const float first_weight = __bfloat162float(q_norm_weight[d]); //weights is of shape HEAD_DIM , same accorss heads 
+            const float second_weight  = __bfloat162float(q_norm_weight[d+HEAD_DIM/2]);
+
+            const float first_value  = g_q[first_index] * rstd * first_weight;
+            const float second_value  = g_q[second_index] * rstd * second_weight;
+
+
+            //roatate each value now 
+            const float cos_value  = __bfloat162float(cos_row[d]);
+            const float sin_value = __bfloat162float(sin_row[d]);
+
+            const float rotated_first  = first_value * cos_value - second_value * sin_value;
+
+            const float rotated_second = second_value * cos_value + first_value * sin_value;
+
+            g_q[first_index] = rotated_first;
+            g_q[second_index] = rotated_second;
+
+        } 
+
+
+
+
+    } else if (global_warp_id < NUM_Q_HEADS + NUM_KV_HEADS)
+    {
+
+        const int kv_head = global_warp_id - NUM_Q_HEADS;
+        const int head_offset  = kv_head * HEAD_DIM;
+
+        float local_sum_sq = 0.0f;
+
+        for (int d = lane_id;d<HEAD_DIM;d+=WARP_SIZE){
+            const float value = g_k[head_offset+d];
+            
+            local_sum_sq += value * value;
+        }
+
+        float sum_sq  = warp_reduce_sum(local_sum_sq); //lane 0 has the final answer 
+
+        sum_sq = __shfl_sync(0xffffffff,sum_sq,0); //broadcast lane id's 0 sum to all other lanes (the 0 in the end is what to broadcast from )
+
+        const float rstd = rsqrtf(
+            sum_sq / HEAD_DIM + RMS_NORM_EPS
+        );
+
+        const size_t cache_offset = static_cast<size_t>(kv_head) * max_seq_len * HEAD_DIM + static_cast<size_t>(position) * HEAD_DIM; //strides since kv cache is in pattern of kv_heads,max_seq_len,head_dim , you need to stride in memory kv_head*max_seq_len*head_dim in order to get to right positon for right kv head then for correct token its position + HEAD_DIM
+
+
+
+
+        for (int d = lane_id; d<HEAD_DIM/2;d+=WARP_SIZE){
+
+            const int first_index  = head_offset +d;
+            const int second_index = head_offset + d + HEAD_DIM /2;
+
+            const float first_weight = __bfloat162float(k_norm_weight[d]); //weights is of shape HEAD_DIM , same accorss heads 
+            const float second_weight  = __bfloat162float(k_norm_weight[d+HEAD_DIM/2]);
+
+            const float first_value  = g_k[first_index] * rstd * first_weight;
+            const float second_value  = g_k[second_index] * rstd * second_weight;
+
+
+            //roatate each value now 
+            const float cos_value  = __bfloat162float(cos_row[d]);
+            const float sin_value = __bfloat162float(sin_row[d]);
+
+            const float rotated_first  = first_value * cos_value - second_value * sin_value;
+
+            const float rotated_second = second_value * cos_value + first_value * sin_value;
+
+            g_k[first_index] = rotated_first;
+            g_k[second_index] = rotated_second;
+
+            k_cache[cache_offset+d] = __float2bfloat16(rotated_first);
+            k_cache[cache_offset+d+HEAD_DIM/2] = __float2bfloat16(rotated_second);
+
+        } 
+
+        for (int d = lane_id;d<HEAD_DIM;d+=WARP_SIZE){
+            v_cache[cache_offset+d] = __float2bfloat16(g_v[head_offset+d]);
+        }
+
+
+    }
+    
+    
+
+
+
+
+}
+
+
+
+
+
+
 __global__ void embedding_lookup_kernel(
     int token_id,
     const __nv_bfloat16* __restrict__ embed_weight,
@@ -12,7 +160,14 @@ __global__ void embedding_lookup_kernel(
     const __nv_bfloat16* __restrict__ q_weight,
     const __nv_bfloat16* __restrict__ k_weight,
     const __nv_bfloat16* __restrict__ v_weight,
+    const __nv_bfloat16* __restrict__ q_norm_weight,
+    const __nv_bfloat16* __restrict__ k_norm_weight, 
 
+    const __nv_bfloat16* __restrict__ cos_table, 
+    const __nv_bfloat16* __restrict__ sin_table, 
+
+    __nv_bfloat16* __restrict__ k_cache,
+    __nv_bfloat16* __restrict__ v_cache,
 
     __nv_bfloat16* __restrict__ hidden_buffer,
     float * __restrict__ g_residual,
@@ -20,7 +175,10 @@ __global__ void embedding_lookup_kernel(
 
     float * __restrict__ g_q,
     float * __restrict__ g_k,
-    float * __restrict__ g_v
+    float * __restrict__ g_v,
+
+    int position,
+    int max_seq_len
 )
 {
     cg::grid_group grid = cg::this_grid();
@@ -83,7 +241,7 @@ __global__ void embedding_lookup_kernel(
 
     constexpr int TOTAL_ROWS = Q_SIZE + KV_SIZE + KV_SIZE;
 
-    int warp_id  = threadIdx.x / WARP_SIZE;
+    int warp_id  = threadIdx.x / WARP_SIZE; 
     int lane_id  = threadIdx.x % WARP_SIZE;
 
     int global_warp_id = blockIdx.x * NUM_WARPS + warp_id; //this tells us the row we wanna use 
@@ -125,7 +283,7 @@ __global__ void embedding_lookup_kernel(
 
         for (int k=lane_id;k<HIDDEN_SIZE;k+=WARP_SIZE){
             float weight = __bfloat162float(weight_row[k]);
-            partial_sum += weight * g_activations[k];
+            partial_sum += weight * g_activations[k]; //every thread is doing indivdual partial sum with an offset of 32 
 
         }
 
@@ -139,7 +297,18 @@ __global__ void embedding_lookup_kernel(
     }
 
 
+    grid.sync();  //till here we have q,k,v vectors now we have to do q,k norm and rope 
+
+
+    qk_norm_rope_cache(
+        g_q,g_k,g_v,q_norm_weight,k_norm_weight,cos_table,sin_table,k_cache,v_cache,position,max_seq_len
+    );
+
     grid.sync();
+
+
+
+
 
 
 }
@@ -171,3 +340,5 @@ extern "C" cudaError_t launch_embedding_lookup(
         stream
     );
 }
+
+
