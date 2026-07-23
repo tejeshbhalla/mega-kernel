@@ -6,6 +6,123 @@
 namespace cg = cooperative_groups;
 
 
+
+
+__device__ void attention_decode(
+    const float * __restrict__ g_q,
+    const  __nv_bfloat16 * __restrict__ k_cache,
+    const __nv_bfloat16 * __restrict__ v_cache,
+    float * __restrict__ g_attn_output, // attn output stores 16 heads 128 vals ,
+    int cache_len,
+    int max_seq_len
+
+){
+    //constants for processing 
+
+    constexpr int REPEAT_KV = NUM_Q_HEADS/NUM_KV_HEADS; 
+    const int warp_id  = threadIdx.x / WARP_SIZE;
+    const int lane_id  = threadIdx.x % WARP_SIZE;
+    const int global_warp_id = blockIdx.x * NUM_WARPS + warp_id; //tells us what exact head we are in for the q and kv globally 
+    //each warp does one head we have roughlt 16 heads so almost 2 blocks each of 8 warps sort this out 
+
+    if (global_warp_id >= NUM_Q_HEADS){
+        return;
+    }
+
+    const int q_head = global_warp_id;
+    const int kv_head = global_warp_id / REPEAT_KV; //each q_head uses two kv_heads 0-0,1-0,2/2-1 so 2 uses 1 like this 
+
+    const int q_offset = q_head * HEAD_DIM;
+    const int VALUES_PER_LANE = HEAD_DIM / WARP_SIZE; //128/32 =4 
+
+    float output_accumalator[VALUES_PER_LANE]; //stores per thread local register
+
+    for (int i=0;i<VALUES_PER_LANE;i++){
+        output_accumalator[i] = 0.0f;
+    }
+
+    float RUNNING_MAX = -INFINITY;
+    float RUNNING_SUM = 0.0f;
+    const float SCALE = rsqrtf(static_cast<float>(HEAD_DIM));
+
+
+    /*
+    This loop for this query needs to go to every key in the head we decided per thread as usual since we have 32 here 
+    cache is shaped 
+    num_heads,max_seq_len,head_dim
+    */
+
+    for (int key_value_dim=0;key_value_dim<cache_len;key_value_dim+=1){
+
+        const size_t cache_offset = static_cast<size_t>(kv_head) * max_seq_len * static_cast<size_t>(HEAD_DIM) + key_value_dim * static_cast<size_t>(HEAD_DIM);
+
+        //so this moves us to right key from key 0 in the designated head we are in so moves us to
+        //right head and key 
+
+        float partial_score = 0.0f; //this stores product of q.k 
+
+        for (int i=0;i<VALUES_PER_LANE;i++){
+            const int dimension = lane_id + i * WARP_SIZE;
+            const float q_value = g_q[q_offset+dimension];
+            const float k_value  = __bfloat162float(k_cache[cache_offset+dimension]);
+
+            partial_score += q_value * k_value;
+        }
+
+        float attention_score = warp_reduce_sum(partial_score); //warp reduces accorss 32 threads 
+
+        attention_score = __shfl_sync(
+            0xffffffff,
+            attention_score,
+            0
+        ); //__shfl_sync works as passing (hex of all threads,value to be broadcasted , and index )
+        
+
+        attention_score *= SCALE;
+
+        float NEW_MAX = fmaxf(RUNNING_MAX,attention_score);
+        
+        float correction_factor = expf(RUNNING_MAX-NEW_MAX);
+
+        float current_val = expf(attention_score-NEW_MAX);
+
+        RUNNING_SUM = correction_factor * RUNNING_SUM + current_val;
+
+        //now each lane has the q.k score we will do values 
+        //each thread does 4 values scale by the wight of query and keys sim for that value token 
+
+        for (int i=0;i<VALUES_PER_LANE;i++){
+
+            const int dimension = lane_id + i * WARP_SIZE;
+            
+            const float v_value = __bfloat162float(v_cache[cache_offset+dimension]);
+
+            output_accumalator[i] = output_accumalator[i] * correction_factor + v_value * current_val;
+
+        }
+
+        RUNNING_MAX = NEW_MAX;
+
+
+    }
+
+
+    const float INVERSE_SUM = 1/RUNNING_SUM;
+
+    for (int i=0;i<VALUES_PER_LANE;i++){
+
+            const int dimension = lane_id + i * WARP_SIZE;
+            
+            g_attn_output[q_offset+dimension] = output_accumalator[i] * INVERSE_SUM;
+
+    }
+
+
+
+
+}
+
+
 __device__ void  qk_norm_rope_cache(
     float * __restrict__ g_q,
     float * __restrict__ g_k,
@@ -150,9 +267,6 @@ __device__ void  qk_norm_rope_cache(
 
 
 
-
-
-
 __global__ void embedding_lookup_kernel(
     int token_id,
     const __nv_bfloat16* __restrict__ embed_weight,
@@ -172,12 +286,14 @@ __global__ void embedding_lookup_kernel(
     __nv_bfloat16* __restrict__ hidden_buffer,
     float * __restrict__ g_residual,
     float * __restrict__ g_activations,
+    float * __restrict__ g_attn_output,
 
     float * __restrict__ g_q,
     float * __restrict__ g_k,
     float * __restrict__ g_v,
 
     int position,
+    int cache_len,
     int max_seq_len
 )
 {
@@ -303,6 +419,12 @@ __global__ void embedding_lookup_kernel(
     qk_norm_rope_cache(
         g_q,g_k,g_v,q_norm_weight,k_norm_weight,cos_table,sin_table,k_cache,v_cache,position,max_seq_len
     );
+
+    grid.sync();
+
+    
+
+    attention_decode(g_q,k_cache,v_cache,g_attn_output,cache_len,max_seq_len);
 
     grid.sync();
 
