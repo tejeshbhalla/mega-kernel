@@ -93,6 +93,8 @@ struct LayerWeights {
     const __nv_bfloat16* __restrict__ up_proj_weight,
     const __nv_bfloat16* __restrict__ down_proj_weight,
 
+    const __nv_bfloat16* __restrict__ final_norm_weight,
+
 };
 
 

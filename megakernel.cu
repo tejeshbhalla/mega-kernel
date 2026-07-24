@@ -187,6 +187,7 @@ __device__ void o_proj_residual(
 
 __device__ void attention_decode(
     const float * __restrict__ g_q,
+    const int layer_id,
     const  __nv_bfloat16 * __restrict__ k_cache,
     const __nv_bfloat16 * __restrict__ v_cache,
     float * __restrict__ g_attn_output, // attn output stores 16 heads 128 vals ,
@@ -231,7 +232,7 @@ __device__ void attention_decode(
 
     for (int key_value_dim=0;key_value_dim<cache_len;key_value_dim+=1){
 
-        const size_t cache_offset = static_cast<size_t>(kv_head) * max_seq_len * static_cast<size_t>(HEAD_DIM) + key_value_dim * static_cast<size_t>(HEAD_DIM);
+        const size_t cache_offset = static_cast<size_t>(layer_id) * NUM_KV_HEADS * max_seq_len * static_cast<size_t>(HEAD_DIM) + static_cast<size_t>(kv_head) * max_seq_len * static_cast<size_t>(HEAD_DIM) + key_value_dim * static_cast<size_t>(HEAD_DIM);
 
         //so this moves us to right key from key 0 in the designated head we are in so moves us to
         //right head and key 
@@ -304,6 +305,8 @@ __device__ void  qk_norm_rope_cache(
     float * __restrict__ g_q,
     float * __restrict__ g_k,
     float * __restrict__ g_v,
+    
+    int layer_id,
 
     const __nv_bfloat16* __restrict__ q_norm_weight,
     const __nv_bfloat16* __restrict__ k_norm_weight,
@@ -395,9 +398,7 @@ __device__ void  qk_norm_rope_cache(
             sum_sq / HEAD_DIM + RMS_NORM_EPS
         );
 
-        const size_t cache_offset = static_cast<size_t>(kv_head) * max_seq_len * HEAD_DIM + static_cast<size_t>(position) * HEAD_DIM; //strides since kv cache is in pattern of kv_heads,max_seq_len,head_dim , you need to stride in memory kv_head*max_seq_len*head_dim in order to get to right positon for right kv head then for correct token its position + HEAD_DIM
-
-
+        const size_t cache_offset = static_cast<size_t>(layer_id)* NUM_KV_HEADS * max_seq_len * HEAD_DIM + static_cast<size_t>(kv_head) * max_seq_len * HEAD_DIM + static_cast<size_t>(position) * HEAD_DIM; //strides since kv cache is in pattern of kv_heads,max_seq_len,head_dim , you need to stride in memory kv_head*max_seq_len*head_dim in order to get to right positon for right kv head then for correct token its position + HEAD_DIM
 
 
         for (int d = lane_id; d<HEAD_DIM/2;d+=WARP_SIZE){
@@ -518,7 +519,7 @@ __device__ void input_rms_norm(
     const __nv_bfloat16 * norm_weight,
     const float * g_residual,
     float * smem,
-    float * g_activations,
+    float * g_activations
 
 ){
 
@@ -529,7 +530,7 @@ __device__ void input_rms_norm(
         float local_sum_sq = 0.0f;
 
         for (int i=threadIdx.x;i<HIDDEN_SIZE;i+=BLOCK_SIZE){
-                float value  = __bfloat162float(hidden_buffer[i]);
+                float value  = g_residual[i];
                 local_sum_sq +=  value * value;
                 }
 
@@ -610,7 +611,7 @@ __global__ void embedding_lookup_kernel(
 
     for (int layer_idx=0; layer_idx<NUM_LAYERS;layer_idx+=1){
 
-        const LayerWeights *lw = &layer_weights[i];
+        const LayerWeights *lw = &layer_weights[layer_idx];
 
         input_rms_norm(lw->norm_weight,g_residual,smem,g_activations); 
      
@@ -623,14 +624,18 @@ __global__ void embedding_lookup_kernel(
 
 
         qk_norm_rope_cache(
-                g_q,g_k,g_v,q_norm_weight,k_norm_weight,cos_table,sin_table,k_cache,v_cache,position,max_seq_len
+                g_q,g_k,g_v,layer_idx,lw->q_norm_weight,lw->k_norm_weight,cos_table,sin_table,k_cache,v_cache,position,max_seq_len
         );
+
+        //update cache len 
+        
+        cache_len = min(cache_len+1,max_seq_len);
 
         grid.sync();
 
             
 
-        attention_decode(g_q,k_cache,v_cache,g_attn_output,cache_len,max_seq_len);
+        attention_decode(g_q,layer_idx,k_cache,v_cache,g_attn_output,cache_len,max_seq_len);
         //kernel till here does attention decode and fills out g_attn_output of size n_q_heads*head_dim 
 
         grid.sync();
@@ -640,7 +645,7 @@ __global__ void embedding_lookup_kernel(
 
         o_proj_residual(
                 g_attn_output,
-                o_proj_weight,
+                lw->o_proj_weight,
                 g_residual
         );
             
@@ -648,7 +653,7 @@ __global__ void embedding_lookup_kernel(
 
         post_attn_rms_norm(
                 g_residual,
-                post_attn_norm_weight,
+                lw->post_attn_norm_weight,
                 g_normalized,
                 smem
         );
@@ -657,8 +662,8 @@ __global__ void embedding_lookup_kernel(
 
 
         fused_gate_up_silu(
-                gate_proj_weight,
-                up_proj_weight,
+                lw->gate_proj_weight,
+                lw->up_proj_weight,
                 g_normalized,
                 g_mlp_intermediate
         ); //g_mlp_intermediate is up_projected to 3072 dims 
@@ -666,7 +671,7 @@ __global__ void embedding_lookup_kernel(
         grid.sync();
 
         down_proj_residual(
-                down_proj_weight,
+                lw->down_proj_weight,
                 g_mlp_intermediate,
                 g_residual
         );
@@ -675,6 +680,19 @@ __global__ void embedding_lookup_kernel(
 
 }
 
+    //all layers are done here now we just do post attention rms norm
+
+    post_attn_rms_norm(
+                g_residual,
+                lw->final_norm_weight,
+                g_normalized,
+                smem
+        );
+
+    grid.sync();
+    //at this point g_normalized has the final output of the model of size 1024 
+
+    
 
 }
 
