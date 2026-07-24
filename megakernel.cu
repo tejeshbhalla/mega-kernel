@@ -6,6 +6,134 @@
 namespace cg = cooperative_groups;
 
 
+__device__ fused_gate_up_silu(
+    const __nv_bfloat16* __restrict__ gate_proj_weight, 
+    const __nv_bfloat16* __restrict__ up_proj_weight,
+
+    const float * __restrict__ g_normalized,
+    float * __restrict__ g_mlp_intermediate //stores 3072 intermediate silu(gate) * up values 
+){
+
+    const int warp_id = threadIdx.x / WARP_SIZE;
+    const int lane_id  = threadIdx.x % WARP_SIZE;
+    const int global_warp_id = blockIdx.x * NUM_WARPS + warp_id;
+
+    const int total_warps  = gridDim.x * NUM_WARPS;
+
+    for (int row_id=global_warp_id,row_id<INTERMEDIATE_SIZE;row_id+=total_warps){
+
+        const __nv_bfloat16 *gate_row = gate_proj_weight + (static_cast<size_t>(row_id) * INTERMEDIATE_SIZE);
+        const __nv_bfloat16 *up_row = up_proj_weight + (static_cast<size_t>(row_id) * INTERMEDIATE_SIZE);
+
+        float partial_gate_sum = 0.0f;
+        float partial_up_sum = 0.0f;
+
+        for (int dimension = lane_id;dimension<HIDDEN_SIZE;dimension+=WARP_SIZE){
+
+            partial_gate_sum += __bfloat162float(gate_row[dimension]) * g_normalized[dimension];
+
+            partial_up_sum += __bfloat162float(up_row[dimension]) * g_normalized[dimension];
+            
+        }
+
+        const float full_row_gate_sum = warp_reduce_sum(partial_gate_sum);
+        const float full_row_up_sum = warp_reduce_sum(partial_up_sum);
+
+
+
+        if (lane_id==0){
+            g_mlp_intermediate[row_id] = silu(full_row_gate_sum) * full_row_up_sum;
+
+        }
+
+    }
+
+}
+
+
+
+
+
+__device__ void post_attn_rms_norm(
+    const float * __restrict__ g_residual,
+    const __nv_bfloat16 * __restrict__ post_attn_norm_weight,
+    float * __restrict__ g_normalized,
+    float* smem
+
+){
+
+    if (blockIdx.x==0){
+        return ;
+    } //rms norm on a flat 1024 vector doesnt need more blocks we will reduce accross one blocks 256 threads 
+
+    const int thread_id = threadIdx.x;
+
+    float local_sum_sq = 0.0f;
+
+    for (int i=thread_id;i<HIDDEN_SIZE;i+=BLOCK_SIZE){
+        local_sum_sq+= g_residual[i] * g_residual[i];
+    }
+
+    float total_sum = block_reduce_sum(
+        local_sum_sq,
+        smem
+    );
+
+    float total_sum = total_sum / static_cast<float>(HIDDEN_SIZE);
+
+    float rms_value  = rsqrtf(total_sum + RMS_NORM_EPS);
+
+    for (int i=thread_id;i<HIDDEN_SIZE;i+=BLOCK_SIZE){
+        g_normalized[i] = g_residual[i] * __bfloat162float(post_attn_norm_weight[i]) * rms_value;
+    }
+
+
+}
+
+
+
+
+
+
+
+
+__device__ void o_proj_residual(
+    const float * __restrict__ g_attn_output,
+    const __nv_bfloat16 * __restrict__ o_proj_weight,
+    float * __restrict__ g_residual
+){
+
+    //estimate warp id and also estimate laneid and global warp id 
+
+    const int warp_id = threadIdx.x / WARP_SIZE;
+    const int lane_id  = threadIdx.x % WARP_SIZE;
+    const int global_warp_id = blockIdx.x * NUM_WARPS + warp_id;
+
+    const int total_warps  = gridDim.x * NUM_WARPS; //each warp does multiple rows that is 1024/total_warps
+
+    for (int row_id=global_warp_id; row_id<HIDDEN_SIZE; row_id+=total_warps){
+
+        int offset_o_proj= row_id * Q_SIZE;
+
+        float partial_sum = 0.0f;
+
+        for (int d=lane_id; d<Q_SIZE; d+=WARP_SIZE){
+
+            partial_sum+= __bfloat162float(o_proj_weight[offset_o_proj+d]) * g_attn_output[d];
+        
+        }
+
+        float full_sum = warp_reduce_sum(partial_sum);
+
+        if (lane_id==0){
+            g_residual[row_id] += full_sum;
+        }
+    }
+
+
+}
+
+
 
 
 __device__ void attention_decode(
@@ -274,9 +402,13 @@ __global__ void embedding_lookup_kernel(
     const __nv_bfloat16* __restrict__ q_weight,
     const __nv_bfloat16* __restrict__ k_weight,
     const __nv_bfloat16* __restrict__ v_weight,
+    const __nv_bfloat16* __restrict__ o_proj_weight,
     const __nv_bfloat16* __restrict__ q_norm_weight,
     const __nv_bfloat16* __restrict__ k_norm_weight, 
-
+    const __nv_bfloat16* __restrict__ post_attn_norm_weight,
+    const __nv_bfloat16* __restrict__ gate_proj_weight,
+    const __nv_bfloat16* __restrict__ up_proj_weight,
+    
     const __nv_bfloat16* __restrict__ cos_table, 
     const __nv_bfloat16* __restrict__ sin_table, 
 
@@ -287,6 +419,8 @@ __global__ void embedding_lookup_kernel(
     float * __restrict__ g_residual,
     float * __restrict__ g_activations,
     float * __restrict__ g_attn_output,
+    float * __restrict__ g_normalized,
+    float * __restrict__ g_mlp_intermediate,
 
     float * __restrict__ g_q,
     float * __restrict__ g_k,
@@ -425,8 +559,40 @@ __global__ void embedding_lookup_kernel(
     
 
     attention_decode(g_q,k_cache,v_cache,g_attn_output,cache_len,max_seq_len);
+    //kernel till here does attention decode and fills out g_attn_output of size n_q_heads*head_dim 
 
     grid.sync();
+
+    //fused kernel for doing o_proj and doing skip connection/ residual add 
+
+
+    o_proj_residual(
+        g_attn_output,
+        o_proj_weight,
+        g_residual
+    );
+    
+    grid.sync();
+
+    post_attn_rms_norm(
+        g_residual,
+        post_attn_norm_weight,
+        g_normalized,
+        smem
+    );
+
+    grid.sync();
+
+
+    fused_gate_up_silu(
+        gate_proj_weight,
+        up_proj_weight,
+        g_normalized,
+        g_mlp_intermediate
+    );
+
+    grid.sync()
+
 
 
 
