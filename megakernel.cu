@@ -6,6 +6,48 @@
 namespace cg = cooperative_groups;
 
 
+__device__ void proj_lm_head(
+    const __nv_bfloat16 * __restrict__ lm_head_weight, //shape is vocab_size,1024
+    const float * __restrict__ g_normalized, //shape is 1024
+    float * __restrict__ g_logits //shape is vocab_size
+
+){
+
+    const int warp_id = threadIdx.x / WARP_SIZE;
+    const int lane_id  = threadIdx.x % WARP_SIZE;
+    const int global_warp_id = blockIdx.x * NUM_WARPS + warp_id;
+
+    const int total_warps  = gridDim.x * NUM_WARPS;
+
+    for (int row_id=global_warp_id;row_id<VOCAB_SIZE;row_id+=total_warps){
+        const __nv_bfloat16 * lm_head_row = lm_head_weight + static_cast<size_t>(row_id) * HIDDEN_SIZE; //right row 
+
+        float partial_sum = 0.0f;
+
+        for (int dimension=lane_id;dimension<HIDDEN_SIZE;dimension+=WARP_SIZE){
+
+            partial_sum += __bfloat162float(lm_head_row[dimension]) * g_normalized[dimension];
+
+
+        }
+
+        const float full_sum = warp_reduce_sum(partial_sum);
+
+
+        if (lane_id==0){
+
+            g_logits[row_id] = full_sum;
+
+        }
+
+
+
+    }
+
+
+}
+
+
 
 
 __device__ void  down_proj_residual(
@@ -575,6 +617,7 @@ __global__ void embedding_lookup_kernel(
     float * __restrict__ g_attn_output,
     float * __restrict__ g_normalized,
     float * __restrict__ g_mlp_intermediate,
+    float * __restrict__ g_logits,
 
     float * __restrict__ g_q,
     float * __restrict__ g_k,
@@ -692,7 +735,18 @@ __global__ void embedding_lookup_kernel(
     grid.sync();
     //at this point g_normalized has the final output of the model of size 1024 
 
-    
+    //we need to proj it with lm_head_weight to get logits of size vocab_size in a intermediate buffer with size vocab_size 
+
+    proj_lm_head(
+        lw->lm_head_weight,
+        g_normalized,
+        g_logits
+    );
+
+    grid.sync();
+
+
+
 
 }
 
