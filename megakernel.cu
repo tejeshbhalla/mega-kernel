@@ -443,21 +443,123 @@ __device__ void  qk_norm_rope_cache(
 }
 
 
+__device__ void qkv_projection(
+    const __nv_bfloat16* __restrict__ q_weight,
+    const __nv_bfloat16* __restrict__ k_weight,
+    const __nv_bfloat16* __restrict__ v_weight,
+    const float * g_activations,
+    float * g_q,
+    float * g_k,
+    float * g_v
+
+){
+
+    constexpr int TOTAL_ROWS = Q_SIZE + KV_SIZE + KV_SIZE;
+
+    int warp_id  = threadIdx.x / WARP_SIZE; 
+    int lane_id  = threadIdx.x % WARP_SIZE;
+
+    int global_warp_id = blockIdx.x * NUM_WARPS + warp_id; //this tells us the row we wanna use 
+
+    int total_warps = gridDim.x * NUM_WARPS;
+
+    for (int row_id=global_warp_id;row_id<TOTAL_ROWS;row_id+=total_warps){
+
+            const __nv_bfloat16 * weight_row;
+            float * output_element;
+
+
+            if (row_id<Q_SIZE){
+                    int q_row = row_id;
+
+                    weight_row = q_weight + q_row * HIDDEN_SIZE;
+                    output_element = g_q + q_row; //Question 
+            } else if (row_id< Q_SIZE + KV_SIZE){
+
+                int k_row = row_id - Q_SIZE;
+
+                weight_row = k_weight + k_row * HIDDEN_SIZE;
+
+                output_element = g_k + k_row;
+
+        
+            } else {
+
+                int v_row = row_id - Q_SIZE - KV_SIZE;
+
+                weight_row = v_weight + v_row * HIDDEN_SIZE;
+
+                output_element = g_v + v_row;
+
+
+                }
+
+            float partial_sum = 0.0f;
+
+            for (int k=lane_id;k<HIDDEN_SIZE;k+=WARP_SIZE){
+                    float weight = __bfloat162float(weight_row[k]);
+                    partial_sum += weight * g_activations[k]; //every thread is doing indivdual partial sum with an offset of 32 
+
+                }
+
+            partial_sum = warp_reduce_sum(partial_sum); //reduces sum for that row of q,k or v we got for 32 threads each lane doing skip of 32 elements doing 1024/32 elements each so partial sum only has sum for that thread we do warp reduce accorss 32 threads ot get full row output
+
+            if (lane_id==0){
+                    *output_element = partial_sum;  //deref pointer and store value at correct position since gq is of shape 2048,1
+                } 
+
+
+            }
+
+}
+
+
+__device__ void input_rms_norm(
+    const __nv_bfloat16 * norm_weight,
+    const float * g_residual,
+    float * smem,
+    float * g_activations,
+
+){
+
+
+    if (blockIdx.x==0){
+                    //in this kernel we do rms norm and populate   g_activations 
+
+        float local_sum_sq = 0.0f;
+
+        for (int i=threadIdx.x;i<HIDDEN_SIZE;i+=BLOCK_SIZE){
+                float value  = __bfloat162float(hidden_buffer[i]);
+                local_sum_sq +=  value * value;
+                }
+
+                    //here we have partial sums accorss the threads in this block we have 32 threads in 8 warps 
+                    
+        float total_sum_sq = block_reduce_sum(local_sum_sq,smem);
+        float mean_sum_sq = total_sum_sq / (HIDDEN_SIZE);
+        float rms = rsqrtf(mean_sum_sq + RMS_NORM_EPS);
+
+        for (int i=threadIdx.x;i<HIDDEN_SIZE;i+=BLOCK_SIZE){
+            float value  = g_residual[i];
+            float weight = __bfloat162float(norm_weight[i]);
+            float rms_norm_output = value * weight * rms;
+            g_activations[i] = rms_norm_output;
+
+
+            }
+        }
+
+}
+
+
+
 
 __global__ void embedding_lookup_kernel(
     int token_id,
     const __nv_bfloat16* __restrict__ embed_weight,
-    const __nv_bfloat16* __restrict__ norm_weight,
-    const __nv_bfloat16* __restrict__ q_weight,
-    const __nv_bfloat16* __restrict__ k_weight,
-    const __nv_bfloat16* __restrict__ v_weight,
-    const __nv_bfloat16* __restrict__ o_proj_weight,
-    const __nv_bfloat16* __restrict__ q_norm_weight,
-    const __nv_bfloat16* __restrict__ k_norm_weight, 
-    const __nv_bfloat16* __restrict__ post_attn_norm_weight,
-    const __nv_bfloat16* __restrict__ gate_proj_weight,
-    const __nv_bfloat16* __restrict__ up_proj_weight,
-    const __nv_bfloat16* __restrict__ down_proj_weight,
+
+
+    const LayerWeights* __restrict__ layer_weights,
 
     
     const __nv_bfloat16* __restrict__ cos_table, 
@@ -499,158 +601,79 @@ __global__ void embedding_lookup_kernel(
 
     for (int i = global_thread_id; i < HIDDEN_SIZE; i += total_threads) {
         hidden_buffer[i] = row_ptr[i];
+        g_residual[i] = __bfloat162float(row_ptr[i]);
     }
 
     grid.sync();
 
+    //happens outside layer because we do embed_weight only once 
 
-    if (blockIdx.x==0){
-        //in this kernel we do rms norm and populate g_residual and g_activations 
+    for (int layer_idx=0; layer_idx<NUM_LAYERS;layer_idx+=1){
 
-        float local_sum_sq = 0.0f;
+        const LayerWeights *lw = &layer_weights[i];
 
-        for (int i=threadIdx.x;i<HIDDEN_SIZE;i+=BLOCK_SIZE){
-            float value  = __bfloat162float(hidden_buffer[i]);
-
-            g_residual[i] = value;
-
-            local_sum_sq +=  value * value;
-        }
-
-        //here we have partial sums accorss the threads in this block we have 32 threads in 8 warps 
-        
-        float total_sum_sq = block_reduce_sum(local_sum_sq,smem);
-
-        float mean_sum_sq = total_sum_sq / (HIDDEN_SIZE);
-
-        float rms = rsqrtf(mean_sum_sq + RMS_NORM_EPS);
-
-        for (int i=threadIdx.x;i<HIDDEN_SIZE;i+=BLOCK_SIZE){
-            float value  = g_residual[i];
-            float weight = __bfloat162float(norm_weight[i]);
-
-            float rms_norm_output = value * weight * rms;
-
-            g_activations[i] = rms_norm_output;
-        }
+        input_rms_norm(lw->norm_weight,g_residual,smem,g_activations); 
+     
+        grid.sync();
 
 
-    }
+        qkv_projection(lw->q_weight,lw->k_weight,lw->v_weight,g_activations,g_q,g_k,g_v);
 
-    grid.sync();
-
-
-    constexpr int TOTAL_ROWS = Q_SIZE + KV_SIZE + KV_SIZE;
-
-    int warp_id  = threadIdx.x / WARP_SIZE; 
-    int lane_id  = threadIdx.x % WARP_SIZE;
-
-    int global_warp_id = blockIdx.x * NUM_WARPS + warp_id; //this tells us the row we wanna use 
-
-    int total_warps = gridDim.x * NUM_WARPS;
-
-    for (int row_id=global_warp_id;row_id<TOTAL_ROWS;row_id+=total_warps){
-
-        const __nv_bfloat16 * weight_row;
-        float * output_element;
+        grid.sync();  //till here we have q,k,v vectors now we have to do q,k norm and rope 
 
 
-        if (row_id<Q_SIZE){
-            int q_row = row_id;
+        qk_norm_rope_cache(
+                g_q,g_k,g_v,q_norm_weight,k_norm_weight,cos_table,sin_table,k_cache,v_cache,position,max_seq_len
+        );
 
-            weight_row = q_weight + q_row * HIDDEN_SIZE;
-            output_element = g_q + q_row; //Question 
-        } else if (row_id< Q_SIZE + KV_SIZE){
+        grid.sync();
 
-            int k_row = row_id - Q_SIZE;
+            
 
-            weight_row = k_weight + k_row * HIDDEN_SIZE;
+        attention_decode(g_q,k_cache,v_cache,g_attn_output,cache_len,max_seq_len);
+        //kernel till here does attention decode and fills out g_attn_output of size n_q_heads*head_dim 
 
-            output_element = g_k + k_row;
+        grid.sync();
 
- 
-        } else {
-
-            int v_row = row_id - Q_SIZE - KV_SIZE;
-
-            weight_row = v_weight + v_row * HIDDEN_SIZE;
-
-            output_element = g_v + v_row;
+        //fused kernel for doing o_proj and doing skip connection/ residual add 
 
 
-        }
+        o_proj_residual(
+                g_attn_output,
+                o_proj_weight,
+                g_residual
+        );
+            
+        grid.sync();
 
-        float partial_sum = 0.0f;
+        post_attn_rms_norm(
+                g_residual,
+                post_attn_norm_weight,
+                g_normalized,
+                smem
+        );
 
-        for (int k=lane_id;k<HIDDEN_SIZE;k+=WARP_SIZE){
-            float weight = __bfloat162float(weight_row[k]);
-            partial_sum += weight * g_activations[k]; //every thread is doing indivdual partial sum with an offset of 32 
-
-        }
-
-        partial_sum = warp_reduce_sum(partial_sum); //reduces sum for that row of q,k or v we got for 32 threads each lane doing skip of 32 elements doing 1024/32 elements each so partial sum only has sum for that thread we do warp reduce accorss 32 threads ot get full row output
-
-        if (lane_id==0){
-            *output_element = partial_sum;  //deref pointer and store value at correct position since gq is of shape 2048,1
-        } 
-
-
-    }
+        grid.sync();
 
 
-    grid.sync();  //till here we have q,k,v vectors now we have to do q,k norm and rope 
+        fused_gate_up_silu(
+                gate_proj_weight,
+                up_proj_weight,
+                g_normalized,
+                g_mlp_intermediate
+        ); //g_mlp_intermediate is up_projected to 3072 dims 
 
+        grid.sync();
 
-    qk_norm_rope_cache(
-        g_q,g_k,g_v,q_norm_weight,k_norm_weight,cos_table,sin_table,k_cache,v_cache,position,max_seq_len
-    );
+        down_proj_residual(
+                down_proj_weight,
+                g_mlp_intermediate,
+                g_residual
+        );
 
-    grid.sync();
+        grid.sync();
 
-    
-
-    attention_decode(g_q,k_cache,v_cache,g_attn_output,cache_len,max_seq_len);
-    //kernel till here does attention decode and fills out g_attn_output of size n_q_heads*head_dim 
-
-    grid.sync();
-
-    //fused kernel for doing o_proj and doing skip connection/ residual add 
-
-
-    o_proj_residual(
-        g_attn_output,
-        o_proj_weight,
-        g_residual
-    );
-    
-    grid.sync();
-
-    post_attn_rms_norm(
-        g_residual,
-        post_attn_norm_weight,
-        g_normalized,
-        smem
-    );
-
-    grid.sync();
-
-
-    fused_gate_up_silu(
-        gate_proj_weight,
-        up_proj_weight,
-        g_normalized,
-        g_mlp_intermediate
-    ); //g_mlp_intermediate is up_projected to 3072 dims 
-
-    grid.sync();
-
-    down_proj_residual(
-        down_proj_weight,
-        g_mlp_intermediate,
-        g_residual
-    );
-
-    grid.sync();
+}
 
 
 }

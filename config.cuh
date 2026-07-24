@@ -31,6 +31,72 @@ constexpr int LM_HEAD_BLOCK_SIZE = 256;
 
 // REDUCTION HELPERS
 
+
+
+//layer weights struct 
+
+/*
+   int token_id,
+    const __nv_bfloat16* __restrict__ embed_weight,
+    const __nv_bfloat16* __restrict__ norm_weight,
+    const __nv_bfloat16* __restrict__ q_weight,
+    const __nv_bfloat16* __restrict__ k_weight,
+    const __nv_bfloat16* __restrict__ v_weight,
+    const __nv_bfloat16* __restrict__ o_proj_weight,
+    const __nv_bfloat16* __restrict__ q_norm_weight,
+    const __nv_bfloat16* __restrict__ k_norm_weight, 
+    const __nv_bfloat16* __restrict__ post_attn_norm_weight,
+    const __nv_bfloat16* __restrict__ gate_proj_weight,
+    const __nv_bfloat16* __restrict__ up_proj_weight,
+    const __nv_bfloat16* __restrict__ down_proj_weight,
+
+    
+    const __nv_bfloat16* __restrict__ cos_table, 
+    const __nv_bfloat16* __restrict__ sin_table, 
+
+    __nv_bfloat16* __restrict__ k_cache,
+    __nv_bfloat16* __restrict__ v_cache,
+
+    __nv_bfloat16* __restrict__ hidden_buffer,
+    float * __restrict__ g_residual,
+    float * __restrict__ g_activations,
+    float * __restrict__ g_attn_output,
+    float * __restrict__ g_normalized,
+    float * __restrict__ g_mlp_intermediate,
+
+    float * __restrict__ g_q,
+    float * __restrict__ g_k,
+    float * __restrict__ g_v,
+
+    int position,
+    int cache_len,
+    int max_seq_len
+
+*/
+
+struct LayerWeights {
+    const __nv_bfloat16* __restrict__ norm_weight,
+
+    const __nv_bfloat16* __restrict__ q_weight,
+    const __nv_bfloat16* __restrict__ k_weight,
+    const __nv_bfloat16* __restrict__ v_weight,
+
+
+    const __nv_bfloat16* __restrict__ q_norm_weight,
+    const __nv_bfloat16* __restrict__ k_norm_weight, 
+
+    const __nv_bfloat16* __restrict__ o_proj_weight,
+
+    const __nv_bfloat16* __restrict__ post_attn_norm_weight,
+
+    const __nv_bfloat16* __restrict__ gate_proj_weight,
+    const __nv_bfloat16* __restrict__ up_proj_weight,
+    const __nv_bfloat16* __restrict__ down_proj_weight,
+
+};
+
+
+
 __device__ __forceinline__ float warp_reduce_sum(float value) {
     for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
         value += __shfl_down_sync(0xffffffff, value, offset);
