@@ -6,7 +6,56 @@
 namespace cg = cooperative_groups;
 
 
-__device__ fused_gate_up_silu(
+
+
+__device__ void  down_proj_residual(
+    const __nv_bfloat16 * __restrict__ down_proj_weight, //shape is 1024,3072
+    const float * __restrict__ g_mlp_intermediate, //shape is 3072 
+    float * __restrict__ g_residual //shape is 1024,
+
+){
+
+    const int warp_id = threadIdx.x / WARP_SIZE;
+    const int lane_id  = threadIdx.x % WARP_SIZE;
+    const int global_warp_id = blockIdx.x * NUM_WARPS + warp_id;
+
+    const int total_warps  = gridDim.x * NUM_WARPS;
+
+    for (int row_id=global_warp_id;row_id<HIDDEN_SIZE;row_id+=total_warps){
+
+        const __nv_bfloat16 *down_row_data = down_proj_weight + static_cast<size_t>(row_id) * INTERMEDIATE_SIZE;
+
+        float partial_sum = 0.0f;
+
+        for (int dimension=lane_id;dimension<INTERMEDIATE_SIZE;dimension+=WARP_SIZE){
+
+            partial_sum+= __bfloat162float(down_row_data[dimension]) * g_mlp_intermediate[dimension];
+
+        }
+
+        float full_row_sum = warp_reduce_sum(partial_sum);
+
+        if (lane_id==0){
+
+            g_residual[row_id] += full_row_sum;
+
+        }
+
+
+    }
+
+
+}
+
+
+
+
+
+
+
+
+
+__device__ void  fused_gate_up_silu(
     const __nv_bfloat16* __restrict__ gate_proj_weight, 
     const __nv_bfloat16* __restrict__ up_proj_weight,
 
@@ -20,10 +69,10 @@ __device__ fused_gate_up_silu(
 
     const int total_warps  = gridDim.x * NUM_WARPS;
 
-    for (int row_id=global_warp_id,row_id<INTERMEDIATE_SIZE;row_id+=total_warps){
+    for (int row_id=global_warp_id;row_id<INTERMEDIATE_SIZE;row_id+=total_warps){
 
-        const __nv_bfloat16 *gate_row = gate_proj_weight + (static_cast<size_t>(row_id) * INTERMEDIATE_SIZE);
-        const __nv_bfloat16 *up_row = up_proj_weight + (static_cast<size_t>(row_id) * INTERMEDIATE_SIZE);
+        const __nv_bfloat16 *gate_row = gate_proj_weight + (static_cast<size_t>(row_id) * HIDDEN_SIZE);
+        const __nv_bfloat16 *up_row = up_proj_weight + (static_cast<size_t>(row_id) * HIDDEN_SIZE);
 
         float partial_gate_sum = 0.0f;
         float partial_up_sum = 0.0f;
@@ -62,7 +111,7 @@ __device__ void post_attn_rms_norm(
 
 ){
 
-    if (blockIdx.x==0){
+    if (blockIdx.x!=0){
         return ;
     } //rms norm on a flat 1024 vector doesnt need more blocks we will reduce accross one blocks 256 threads 
 
@@ -79,7 +128,7 @@ __device__ void post_attn_rms_norm(
         smem
     );
 
-    float total_sum = total_sum / static_cast<float>(HIDDEN_SIZE);
+    total_sum = total_sum / static_cast<float>(HIDDEN_SIZE);
 
     float rms_value  = rsqrtf(total_sum + RMS_NORM_EPS);
 
@@ -408,6 +457,8 @@ __global__ void embedding_lookup_kernel(
     const __nv_bfloat16* __restrict__ post_attn_norm_weight,
     const __nv_bfloat16* __restrict__ gate_proj_weight,
     const __nv_bfloat16* __restrict__ up_proj_weight,
+    const __nv_bfloat16* __restrict__ down_proj_weight,
+
     
     const __nv_bfloat16* __restrict__ cos_table, 
     const __nv_bfloat16* __restrict__ sin_table, 
@@ -589,14 +640,17 @@ __global__ void embedding_lookup_kernel(
         up_proj_weight,
         g_normalized,
         g_mlp_intermediate
+    ); //g_mlp_intermediate is up_projected to 3072 dims 
+
+    grid.sync();
+
+    down_proj_residual(
+        down_proj_weight,
+        g_mlp_intermediate,
+        g_residual
     );
 
-    grid.sync()
-
-
-
-
-
+    grid.sync();
 
 
 }
