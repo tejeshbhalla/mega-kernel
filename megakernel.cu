@@ -347,7 +347,7 @@ __device__ void  qk_norm_rope_cache(
     float * __restrict__ g_q,
     float * __restrict__ g_k,
     float * __restrict__ g_v,
-    
+
     int layer_id,
 
     const __nv_bfloat16* __restrict__ q_norm_weight,
@@ -597,10 +597,11 @@ __device__ void input_rms_norm(
 
 
 
-__global__ void embedding_lookup_kernel(
+__global__ void decode_kernel(
     int token_id,
     const __nv_bfloat16* __restrict__ embed_weight,
-
+    const __nv_bfloat16* __restrict__ lm_head_weight,
+    const __nv_bfloat16* __restrict__ final_norm_weight,
 
     const LayerWeights* __restrict__ layer_weights,
 
@@ -672,8 +673,6 @@ __global__ void embedding_lookup_kernel(
 
         //update cache len 
         
-        cache_len = min(cache_len+1,max_seq_len);
-
         grid.sync();
 
             
@@ -727,7 +726,7 @@ __global__ void embedding_lookup_kernel(
 
     post_attn_rms_norm(
                 g_residual,
-                lw->final_norm_weight,
+                final_norm_weight,
                 g_normalized,
                 smem
         );
@@ -738,7 +737,7 @@ __global__ void embedding_lookup_kernel(
     //we need to proj it with lm_head_weight to get logits of size vocab_size in a intermediate buffer with size vocab_size 
 
     proj_lm_head(
-        lw->lm_head_weight,
+        lm_head_weight,
         g_normalized,
         g_logits
     );
@@ -750,26 +749,99 @@ __global__ void embedding_lookup_kernel(
 
 }
 
-extern "C" cudaError_t launch_embedding_lookup(
+
+
+
+extern "C" cudaError_t launch_decode_kernel(
     int token_id,
-    const void* embed_weight,
-    void* hidden_buffer,
+
+    const void * embed_weight,
+    const void * lm_head_weight,
+    const void * final_norm_weight,
+
+    const void * layer_weights,
+
+    const void * cos_table,
+    const void * sin_table,
+
+    void * k_cache,
+    void * v_cache,
+    void * hidden_buffer,
+
+    void *  g_residual,
+    void *  g_activations,
+    void *  g_attn_output,
+    void *  g_normalized,
+    void *  g_mlp_intermediate,
+    void *  g_logits,
+    void *  g_q,
+    void *  g_k,
+    void *  g_v,
+
+    int position,
+    int cache_len,
+    int max_seq_len,
     cudaStream_t stream)
 {
     const __nv_bfloat16 *typed_embed_weight =
         static_cast<const __nv_bfloat16*>(embed_weight);
+    const __nv_bfloat16 *typed_lm_head_weight =
+        static_cast<const __nv_bfloat16*>(lm_head_weight);
+    const __nv_bfloat16 *typed_final_norm_weight =
+        static_cast<const __nv_bfloat16*>(final_norm_weight);
+
+    const LayerWeights * typed_layer_weights = static_cast<const LayerWeights *>(layer_weights);
+
+    const __nv_bfloat16 *typed_cos_table =
+        static_cast<const __nv_bfloat16*>(cos_table);
+    const __nv_bfloat16 *typed_sin_table =
+        static_cast<const __nv_bfloat16*>(sin_table);
+    __nv_bfloat16 *typed_k_cache =
+        static_cast<__nv_bfloat16*>(k_cache);
+    __nv_bfloat16 *typed_v_cache =
+        static_cast<__nv_bfloat16*>(v_cache);
+
 
     __nv_bfloat16 *typed_hidden_buffer =
         static_cast<__nv_bfloat16*>(hidden_buffer);
+    float *typed_g_residual = static_cast<float*>(g_residual);
+    float *typed_g_activations = static_cast<float*>(g_activations);
+    float *typed_g_attn_output = static_cast<float*>(g_attn_output);
+    float *typed_g_normalized = static_cast<float*>(g_normalized);
+    float *typed_g_mlp_intermediate = static_cast<float*>(g_mlp_intermediate);
+    float *typed_g_logits = static_cast<float*>(g_logits);
+    float *typed_g_q = static_cast<float*>(g_q);
+    float *typed_g_k = static_cast<float*>(g_k);
+    float *typed_g_v = static_cast<float*>(g_v);
+
 
     void* kernel_args[] = {
         &token_id,
         &typed_embed_weight,
-        &typed_hidden_buffer
+        &typed_lm_head_weight,
+        &typed_final_norm_weight,
+        &typed_layer_weights,
+        &typed_cos_table,
+        &typed_sin_table,
+        &typed_k_cache,
+        &typed_v_cache,
+        &typed_hidden_buffer,
+        &typed_g_residual,
+        &typed_g_activations,
+        &typed_g_attn_output,
+        &typed_g_normalized,
+        &typed_g_mlp_intermediate,
+        &typed_g_logits,
+        &typed_g_q,
+        &typed_g_k,
+        &typed_g_v,
+        &position,
+        &cache_len,
+        &max_seq_len
     };
 
     return cudaLaunchCooperativeKernel(
-        reinterpret_cast<void*>(embedding_lookup_kernel),
+        reinterpret_cast<void*>(decode_kernel),  //convert to  void * from void because this takes pointer ref to function
         dim3(DECODE_NUM_BLOCKS),
         dim3(BLOCK_SIZE),
         kernel_args,
@@ -777,5 +849,3 @@ extern "C" cudaError_t launch_embedding_lookup(
         stream
     );
 }
-
-

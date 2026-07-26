@@ -22,9 +22,9 @@ constexpr int WARP_SIZE = 32;
 constexpr int BLOCK_SIZE = 256;
 constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE; // 8 warps per block.
 
-// This checkpoint targets a full A100 with 108 SMs. A cooperative grid must be
+// This checkpoint targets a full 3090 with 82 SMs. A cooperative grid must be
 // small enough for every block to be resident simultaneously.
-constexpr int DECODE_NUM_BLOCKS = 108; 
+constexpr int DECODE_NUM_BLOCKS = 82;
 
 constexpr int LM_HEAD_NUM_BLOCKS = 1184;
 constexpr int LM_HEAD_BLOCK_SIZE = 256;
@@ -75,26 +75,17 @@ constexpr int LM_HEAD_BLOCK_SIZE = 256;
 */
 
 struct LayerWeights {
-    const __nv_bfloat16* __restrict__ norm_weight,
-
-    const __nv_bfloat16* __restrict__ q_weight,
-    const __nv_bfloat16* __restrict__ k_weight,
-    const __nv_bfloat16* __restrict__ v_weight,
-
-
-    const __nv_bfloat16* __restrict__ q_norm_weight,
-    const __nv_bfloat16* __restrict__ k_norm_weight, 
-
-    const __nv_bfloat16* __restrict__ o_proj_weight,
-
-    const __nv_bfloat16* __restrict__ post_attn_norm_weight,
-
-    const __nv_bfloat16* __restrict__ gate_proj_weight,
-    const __nv_bfloat16* __restrict__ up_proj_weight,
-    const __nv_bfloat16* __restrict__ down_proj_weight,
-
-    const __nv_bfloat16* __restrict__ final_norm_weight,
-
+    const __nv_bfloat16* norm_weight;
+    const __nv_bfloat16* q_weight;
+    const __nv_bfloat16* k_weight;
+    const __nv_bfloat16* v_weight;
+    const __nv_bfloat16* q_norm_weight;
+    const __nv_bfloat16* k_norm_weight;
+    const __nv_bfloat16* o_proj_weight;
+    const __nv_bfloat16* post_attn_norm_weight;
+    const __nv_bfloat16* gate_proj_weight;
+    const __nv_bfloat16* up_proj_weight;
+    const __nv_bfloat16* down_proj_weight;
 };
 
 
