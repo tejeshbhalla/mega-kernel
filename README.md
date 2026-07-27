@@ -11,13 +11,6 @@ token decoding with the custom CUDA kernel.
 
 ![Hugging Face versus CUDA decode benchmark](assets/decode-benchmark.svg)
 
-| Decoder | Latency | Throughput |
-|---|---:|---:|
-| Hugging Face Transformers | 27.444 ms/token | 36.44 tokens/s |
-| CUDA mega-kernel | 7.712 ms/token | 129.67 tokens/s |
-| **CUDA speedup** | **3.56x** | **3.56x** |
-
-Benchmark environment:
 
 - GPU: NVIDIA GeForce RTX 3090
 - Model: Qwen/Qwen3-0.6B in BF16
