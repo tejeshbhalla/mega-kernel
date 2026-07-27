@@ -127,9 +127,7 @@ with torch.inference_mode():
         decode_times.append(start.elapsed_time(end))
 
 
-print("\n")
-print("Generated text:")
-print(tokenizer.decode(generated_tokens, skip_special_tokens=True))
+kernel_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
 
 if decode_times:
     average_ms = sum(decode_times) / len(decode_times)
@@ -181,5 +179,14 @@ print(f"HF decode time:         {hf_average_ms:.3f} ms/token")
 print(f"HF throughput:          {1000.0 / hf_average_ms:.2f} tokens/second")
 print(f"Kernel speedup:         {hf_average_ms / average_ms:.2f}x")
 
-print("\nHF generated text:")
-print(tokenizer.decode(hf_generated_tokens, skip_special_tokens=True))
+hf_text = tokenizer.decode(hf_generated_tokens, skip_special_tokens=True)
+
+print("\n" + "=" * 70)
+print("CUDA KERNEL GENERATED TEXT")
+print("=" * 70)
+print(kernel_text)
+
+print("\n" + "=" * 70)
+print("HUGGING FACE GENERATED TEXT")
+print("=" * 70)
+print(hf_text)

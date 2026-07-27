@@ -153,9 +153,9 @@ __device__ void post_attn_rms_norm(
 
 ){
 
-    if (blockIdx.x!=0){
-        return ;
-    } //rms norm on a flat 1024 vector doesnt need more blocks we will reduce accross one blocks 256 threads 
+   // if (blockIdx.x!=0){
+       // return ;
+   //} //rms norm on a flat 1024 vector doesnt need more blocks we will reduce accross one blocks 256 threads 
 
     const int thread_id = threadIdx.x;
 
@@ -566,7 +566,7 @@ __device__ void input_rms_norm(
 ){
 
 
-    if (blockIdx.x==0){
+    if (blockIdx.x>=0){
                     //in this kernel we do rms norm and populate   g_activations 
 
         float local_sum_sq = 0.0f;
@@ -700,9 +700,7 @@ __global__ void decode_kernel(
                 smem
         );
 
-        grid.sync();
-
-
+        //grid.sync(); 
         fused_gate_up_silu(
                 lw->gate_proj_weight,
                 lw->up_proj_weight,
@@ -731,7 +729,7 @@ __global__ void decode_kernel(
                 smem
         );
 
-    grid.sync();
+    //grid.sync();
     //at this point g_normalized has the final output of the model of size 1024 
 
     //we need to proj it with lm_head_weight to get logits of size vocab_size in a intermediate buffer with size vocab_size 
