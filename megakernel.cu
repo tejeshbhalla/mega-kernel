@@ -777,6 +777,7 @@ __global__ void decode_kernel(
     
     // shared warp memory 
     __shared__ float smem[NUM_WARPS]; //memory with 8 slots 
+    __shared__ float smem_attention[NUM_WARPS*(HEAD_DIM+2)];
 
 
     const __nv_bfloat16* row_ptr =
@@ -821,7 +822,7 @@ __global__ void decode_kernel(
 
             
 
-        attention_decode_block_per_head(g_q,layer_idx,k_cache,v_cache,g_attn_output,cache_len,max_seq_len);
+        attention_decode_block_per_head(g_q,layer_idx,k_cache,v_cache,g_attn_output,cache_len,max_seq_len,smem_attention);
         //kernel till here does attention decode and fills out g_attn_output of size n_q_heads*head_dim 
 
         grid.sync();

@@ -1,18 +1,18 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="920" height="430" viewBox="0 0 920 430" role="img" aria-labelledby="title desc">
   <title id="title">Qwen3-0.6B decode benchmark on RTX 3090</title>
-  <desc id="desc">CUDA mega-kernel reaches 202.12 tokens per second compared with 25.15 for Hugging Face, and 4.948 milliseconds per token compared with 39.764, an 8.04 times speedup.</desc>
+  <desc id="desc">CUDA mega-kernel reaches 325.57 tokens per second compared with 22.34 for Hugging Face, and 3.072 milliseconds per token compared with 44.766, a 14.57 times speedup.</desc>
   <rect width="920" height="430" rx="18" fill="#0d1117"/>
   <text x="48" y="50" fill="#f0f6fc" font-family="Arial, sans-serif" font-size="25" font-weight="700">Qwen3-0.6B Decode · RTX 3090</text>
-  <text x="48" y="78" fill="#8b949e" font-family="Arial, sans-serif" font-size="14">Batch 1 · BF16 · CUDA event timing · prefill excluded · HF: 105 measured tokens</text>
+  <text x="48" y="78" fill="#8b949e" font-family="Arial, sans-serif" font-size="14">Batch 1 · BF16 · CUDA event timing · prefill excluded · kernel: 95 · HF: 105 measured tokens</text>
 
   <text x="48" y="125" fill="#f0f6fc" font-family="Arial, sans-serif" font-size="17" font-weight="700">Throughput</text>
   <text x="850" y="125" fill="#8b949e" text-anchor="end" font-family="Arial, sans-serif" font-size="13">tokens/second · higher is better</text>
   <text x="48" y="165" fill="#c9d1d9" font-family="Arial, sans-serif" font-size="14">Hugging Face</text>
-  <rect x="175" y="145" width="84" height="28" rx="6" fill="#6e7681"/>
-  <text x="271" y="165" fill="#f0f6fc" font-family="Arial, sans-serif" font-size="14" font-weight="700">25.15</text>
+  <rect x="175" y="145" width="46" height="28" rx="6" fill="#6e7681"/>
+  <text x="233" y="165" fill="#f0f6fc" font-family="Arial, sans-serif" font-size="14" font-weight="700">22.34</text>
   <text x="48" y="210" fill="#c9d1d9" font-family="Arial, sans-serif" font-size="14">CUDA kernel</text>
   <rect x="175" y="190" width="675" height="28" rx="6" fill="#2f81f7"/>
-  <text x="838" y="210" fill="#ffffff" text-anchor="end" font-family="Arial, sans-serif" font-size="14" font-weight="700">202.12</text>
+  <text x="838" y="210" fill="#ffffff" text-anchor="end" font-family="Arial, sans-serif" font-size="14" font-weight="700">325.57</text>
 
   <line x1="48" y1="250" x2="872" y2="250" stroke="#30363d"/>
 
@@ -20,11 +20,11 @@
   <text x="850" y="290" fill="#8b949e" text-anchor="end" font-family="Arial, sans-serif" font-size="13">milliseconds/token · lower is better</text>
   <text x="48" y="330" fill="#c9d1d9" font-family="Arial, sans-serif" font-size="14">Hugging Face</text>
   <rect x="175" y="310" width="675" height="28" rx="6" fill="#6e7681"/>
-  <text x="838" y="330" fill="#ffffff" text-anchor="end" font-family="Arial, sans-serif" font-size="14" font-weight="700">39.764 ms</text>
+  <text x="838" y="330" fill="#ffffff" text-anchor="end" font-family="Arial, sans-serif" font-size="14" font-weight="700">44.766 ms</text>
   <text x="48" y="375" fill="#c9d1d9" font-family="Arial, sans-serif" font-size="14">CUDA kernel</text>
-  <rect x="175" y="355" width="84" height="28" rx="6" fill="#3fb950"/>
-  <text x="271" y="375" fill="#f0f6fc" font-family="Arial, sans-serif" font-size="14" font-weight="700">4.948 ms</text>
+  <rect x="175" y="355" width="46" height="28" rx="6" fill="#3fb950"/>
+  <text x="233" y="375" fill="#f0f6fc" font-family="Arial, sans-serif" font-size="14" font-weight="700">3.072 ms</text>
 
   <rect x="690" y="392" width="182" height="25" rx="12" fill="#1f6feb"/>
-  <text x="781" y="410" fill="#ffffff" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" font-weight="700">8.04x faster</text>
+  <text x="781" y="410" fill="#ffffff" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" font-weight="700">14.57x faster</text>
 </svg>
