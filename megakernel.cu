@@ -225,6 +225,150 @@ __device__ void o_proj_residual(
 }
 
 
+__device__ void attention_decode_block_per_head(
+    const float * __restrict__ g_q,
+    const int layer_id,
+    const __nv_bfloat16 * k_cache,
+    const __nv_bfloat16 * v_cache,
+    float * __restrict__ g_attn_output,
+    int cache_len,
+    int max_seq_len,
+    float * __restrict__ smem //shape is NUM_WARPS * (HEAD_SIZE+2) (for max and sum)) // instead of using a struct we just use a flat vector 
+
+){
+
+    const int q_head  = blockIdx.x; //since each block does one head we already know what q_head we wanna process 
+
+    if (q_head>=NUM_Q_HEADS){
+        return; //blocks are > NUM_Q_HEADS, empty block will use them for prefetching later 
+    }
+
+    const int REPEAT_KV = NUM_Q_HEADS/NUM_KV_HEADS; //tells us about what repeat factor to use 
+
+    const int kv_head = q_head / REPEAT_KV; //we have 16 q heads so , say we are at head of q 0 and 1 for it the key head is repeated as 0 since 0/2 and 1/2 are both 0 then at q_head index 2/2 we start using key 1 
+
+    const int lane_id = threadIdx.x % WARP_SIZE;
+    const int warp_id = threadIdx.x / WARP_SIZE; 
+
+    //now one thing we need to estimate is per lane how many elements of 128 output tensor we can produce , 128/WARP_SIZE , 32 threads gives us 4 
+    const int VALUES_PER_LANE = HEAD_DIM / WARP_SIZE; //4
+
+    float output_accumalator[VALUES_PER_LANE];
+    
+    const int q_offset = q_head* HEAD_DIM;
+
+    for (int i=0;i<VALUES_PER_LANE;i++){
+        output_accumalator[i] = 0.0f;
+    }
+
+    float RUNNING_MAX = -INFINITY;
+    float RUNNING_SUM = 0.0f;
+    const float SCALE = rsqrtf(static_cast<float>(HEAD_DIM));
+
+
+
+    for (int key_idx=warp_id;key_idx<cache_len;key_idx+=NUM_WARPS){
+
+        float partial_sum = 0.0f;
+
+        const size_t cache_offset = static_cast<size_t>(layer_id) * NUM_KV_HEADS * max_seq_len * static_cast<size_t>(HEAD_DIM) + static_cast<size_t>(kv_head) * max_seq_len * static_cast<size_t>(HEAD_DIM) + key_idx * static_cast<size_t>(HEAD_DIM);
+
+
+        for (int i=0;i<VALUES_PER_LANE;i++){
+            int dimension = lane_id + i * WARP_SIZE;
+            partial_sum += g_q[q_offset+dimension] * __bfloat162float(k_cache[cache_offset+dimension]);
+
+
+        }
+
+
+        float attention_score = warp_reduce_sum(partial_sum);
+        //this only exists in lane 0 so we need to broadcast this 
+        attention_score = __shfl_sync(0xffffffff,attention_score,0);
+
+        attention_score = attention_score * SCALE;
+
+        float NEW_MAX = fmaxf(RUNNING_MAX,attention_score);
+
+        float p = expf(attention_score-NEW_MAX);
+
+        RUNNING_SUM = expf(RUNNING_MAX-NEW_MAX) * RUNNING_SUM + p;
+
+
+        for (int i=0;i<VALUES_PER_LANE;i++){
+            int dimension = lane_id + i * WARP_SIZE;
+            float v_value = __bfloat162float(v_cache[cache_offset+dimension]);
+            
+            output_accumalator[i] = output_accumalator[i] * expf(RUNNING_MAX-NEW_MAX) + p * v_value ;
+
+
+        }
+
+        RUNNING_MAX =  NEW_MAX;
+
+    }
+
+    //ok outside this loop each warp has done multiple keys and it has three things output accumalated values , maximum and the sum 
+
+    //we need to write results into smem 
+    int smem_offset = warp_id * (HEAD_DIM +2);
+    float * smem_row = smem + smem_offset; // moves us to right pointer to write the values 
+
+    for (int i=0;i<VALUES_PER_LANE;i++){
+        int dimension = lane_id + i * WARP_SIZE;
+        smem_row[dimension] = output_accumalator[i];
+
+        }
+    if (lane_id==0){
+        smem_row[HEAD_DIM] = RUNNING_MAX;
+        smem_row[HEAD_DIM+1] = RUNNING_SUM;
+    }
+
+    __syncthreads(); //each warp write its values and this waits for all of them to write before we combine results from them and store 
+
+
+    float GLOBAL_MAX_WARP = -INFINITY;
+
+    for (int warp_idx=0; warp_idx<NUM_WARPS;warp_idx++){
+        int warp_offset_smem = warp_idx * (HEAD_DIM+2);
+        GLOBAL_MAX_WARP = fmaxf(GLOBAL_MAX_WARP,smem[warp_offset_smem+HEAD_DIM]);
+
+    }
+
+    float GLOBAL_SUM = 0.0f;
+    float GLOBAL_OUTPUT_ACCUM[VALUES_PER_LANE];
+
+    for (int i=0;i<VALUES_PER_LANE;i++){
+        GLOBAL_OUTPUT_ACCUM[i]=0.0f;
+    };
+
+    //now we have accross warps the correct global max and now we can estimate correct gloabal sum and global output 
+
+    for (int warp_idx=0; warp_idx<NUM_WARPS;warp_idx++){
+        int warp_offset_smem = warp_idx * (HEAD_DIM+2);
+
+        GLOBAL_SUM  += smem[warp_offset_smem+HEAD_DIM+1] * expf(smem[warp_offset_smem+HEAD_DIM] - GLOBAL_MAX_WARP);
+
+        float * warp_row = smem + warp_offset_smem;
+
+        for (int i=0;i<VALUES_PER_LANE;i++){
+            int dimension = lane_id + i * WARP_SIZE;
+            GLOBAL_OUTPUT_ACCUM[i] += warp_row[dimension] * expf(smem[warp_offset_smem+HEAD_DIM] - GLOBAL_MAX_WARP);
+
+        }
+
+    }
+
+    float INVERSE_SUM = 1.0f/GLOBAL_SUM;
+
+    for (int i=0;i<VALUES_PER_LANE;i++){
+            int dimension = lane_id + i * WARP_SIZE;
+            g_attn_output[q_offset+dimension] = GLOBAL_OUTPUT_ACCUM[i] * INVERSE_SUM;
+
+    }
+
+}
+
 
 
 __device__ void attention_decode(
@@ -677,7 +821,7 @@ __global__ void decode_kernel(
 
             
 
-        attention_decode(g_q,layer_idx,k_cache,v_cache,g_attn_output,cache_len,max_seq_len);
+        attention_decode_block_per_head(g_q,layer_idx,k_cache,v_cache,g_attn_output,cache_len,max_seq_len);
         //kernel till here does attention decode and fills out g_attn_output of size n_q_heads*head_dim 
 
         grid.sync();
