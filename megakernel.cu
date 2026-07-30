@@ -6,6 +6,67 @@
 namespace cg = cooperative_groups;
 
 
+//memory prefetch instruction for l2 cache prefetching
+__device__ __forceinline__ void prefetch_l2_line(const void * address){
+    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__>=800)
+        asm volatile("prefetch.global.L2::evict_last [%0];"::"l"(address));
+    #else 
+    
+        asm volatile("prefetch.global.L2 [%0];"::"l"(address));
+
+    #endif
+
+
+}
+
+
+
+__device__ __forceinline__ void prefetch_o_proj_weight(
+    const __nv_bfloat16 * __restrict__ o_proj,
+    int first_prefetch_block,
+    int num_prefetch_blocks
+){
+    // first prefetch block is the idx for the first blocisk that does prefetch in our case its 16th block in this case upto 81
+    //num prefetch blocks is 82-16 ie 66 blocks for prefetching 
+
+    const int global_block_id = blockIdx.x;
+
+    const int local_prefetch_block_id = global_block_id - first_prefetch_block;
+
+    if (local_prefetch_block_id<0){
+        return;
+    }
+
+    const int global_thread_id = local_prefetch_block_id * BLOCK_SIZE + threadIdx.x;
+
+    const int total_threads = num_prefetch_blocks * BLOCK_SIZE;
+    // 66 * 256 = 16896
+
+    const int PREFETCH_GRANULARITY= 64; //64 bytes read per thread 
+
+    const size_t O_PROJ_BYTES = static_cast<size_t>(HIDDEN_SIZE) * Q_SIZE * sizeof(__nv_bfloat16);
+    //1024*2048*2 bytes of total data 
+
+    const char * o_weight_char_pointer = reinterpret_cast<const char *>(o_proj);
+
+    /*
+    So we have 66 blocks 66*256 = 16896 total threads 
+
+    each reads one u data unit and jumps 64 bytes right 
+
+    total bytes to read is - 4194304/16896 = approx - 248
+
+    each thread reads 64 and jumps so - 248/64 (tell us how many jumps each thread does about 4  )
+    */
+
+    for (size_t data_offset = global_thread_id * PREFETCH_GRANULARITY; data_offset< O_PROJ_BYTES; data_offset += total_threads * PREFETCH_GRANULARITY ){
+
+        prefetch_l2_line(o_weight_char_pointer+data_offset);
+    }
+
+}
+
+
 __device__ void proj_lm_head(
     const __nv_bfloat16 * __restrict__ lm_head_weight, //shape is vocab_size,1024
     const float * __restrict__ g_normalized, //shape is 1024
@@ -23,7 +84,6 @@ __device__ void proj_lm_head(
         const __nv_bfloat16 * lm_head_row = lm_head_weight + static_cast<size_t>(row_id) * HIDDEN_SIZE; //right row 
 
         float partial_sum = 0.0f;
-
         for (int dimension=lane_id;dimension<HIDDEN_SIZE;dimension+=WARP_SIZE){
 
             partial_sum += __bfloat162float(lm_head_row[dimension]) * g_normalized[dimension];
@@ -820,11 +880,17 @@ __global__ void decode_kernel(
         
         grid.sync();
 
-            
-
+        if (blockIdx.x < NUM_Q_HEADS){
         attention_decode_block_per_head(g_q,layer_idx,k_cache,v_cache,g_attn_output,cache_len,max_seq_len,smem_attention);
         //kernel till here does attention decode and fills out g_attn_output of size n_q_heads*head_dim 
-
+        } else {
+            prefetch_o_proj_weight(
+                lw->o_proj_weight,
+                NUM_Q_HEADS,
+                DECODE_NUM_BLOCKS - NUM_Q_HEADS
+            ); 
+            int sum = 1+1;
+        }
         grid.sync();
 
         //fused kernel for doing o_proj and doing skip connection/ residual add 
